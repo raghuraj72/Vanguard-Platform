@@ -1,6 +1,6 @@
 # RocketRide Component Reference
 
-**Last Updated:** June 2026
+**Last Updated:** August 2026
 
 ---
 
@@ -21,11 +21,12 @@ When the RocketRide VS Code extension is installed, it populates a `.rocketride/
 
 **IMPORTANT:** Always read `.rocketride/services-catalog.json` for the current list of available components. The catalog is the single source of truth: it is generated from the connected server and may contain components not listed in this document.
 
-> **See also:** [`docs/README-nodes.md`](../README-nodes.md) is the node catalog
-> grouped by category, with each node's lanes and the wire-vs-bind rule.
-> [`docs/README-node-schema.md`](../README-node-schema.md) explains the
-> `services.json` model (`lanes`, `preconfig`/`profiles`, `fields`, `shape`)
-> behind this reference and the canvas UI.
+> **See also:** the two files above are the working pair behind this
+> reference. `.rocketride/services-catalog.json` is the node catalog: every
+> node's class, lanes, and control-plane (`invoke`) requirements.
+> `.rocketride/schema/{component_name}.json` is that node's detailed config
+> model: profiles, required fields, and defaults. Both are explained in the
+> sections below.
 
 ### Reading the Catalog
 
@@ -142,12 +143,16 @@ Lanes are typed data channels that connect components. A connection is valid ONL
 | `tags`      | Metadata         | File metadata and raw file info from sources       |
 | `text`      | Plain text       | Extracted or generated text content                |
 | `table`     | Structured data  | Tables from documents or databases                 |
+| `json`      | JSON objects     | Structured JSON records (webhook bodies, extracted data, JSON responses) |
+| `words`     | Word tokens      | Word-level output (engine lane; no catalog node emits it today) |
 | `documents` | Document objects | Chunked/processed documents with embeddings        |
 | `questions` | Question objects | Questions to be answered (trigger LLMs and search) |
 | `answers`   | Answer objects   | Answers from LLMs or vector stores                 |
 | `image`     | Image data       | Images extracted from documents                    |
 | `audio`     | Audio streams    | Audio content                                      |
 | `video`     | Video streams    | Video content                                      |
+| `classifications` | Classification results | Per-object classification labels (engine lane) |
+| `classificationContext` | Classification context | Classification policy/rules context (engine lane) |
 
 **Source components** use `_source` as the internal lane name in the catalog. You do not reference `_source` in pipeline files; source components automatically produce their output lanes.
 
@@ -307,13 +312,24 @@ This applies to agents, but also to non-agent components like `summarization`, `
 
 ### Memory Requirements by Agent Type
 
-| Agent              | LLM                  | Memory                   | Tools    |
-| ------------------ | -------------------- | ------------------------ | -------- |
-| `agent_rocketride` | Required (exactly 1) | **Required (exactly 1)** | Optional |
-| `agent_crewai`     | Required (min 1)     | Not supported            | Optional |
-| `agent_langchain`  | Required (min 1)     | Not supported            | Optional |
+| Agent                      | LLM                  | Memory                   | Tools         | Sub-agents                             |
+| -------------------------- | -------------------- | ------------------------ | ------------- | -------------------------------------- |
+| `agent_rocketride`         | Required (exactly 1) | **Required (exactly 1)** | Optional      | -                                      |
+| `agent_crewai`             | Required (min 1)     | Not supported            | Optional      | -                                      |
+| `agent_crewai_manager`     | Required (min 1)     | Not supported            | Optional      | Required (min 1, classType `crewai`)   |
+| `agent_crewai_subagent`    | Required (min 1)     | Not supported            | Optional      | -                                      |
+| `agent_deepagent`          | Required (min 1)     | Not supported            | Optional      | Optional (min 0, classType `deepagent`) |
+| `agent_deepagent_subagent` | Required (min 1)     | Not supported            | Optional      | -                                      |
+| `agent_langchain`          | Required (min 1)     | Not supported            | Optional      | -                                      |
+| `agent_llamaindex`         | Required (min 1)     | Not supported            | Optional      | -                                      |
 
-Only `agent_rocketride` supports a `memory_internal` control connection. `agent_crewai` and `agent_langchain` do not have a memory port, do not wire memory to them.
+Only `agent_rocketride` supports a `memory_internal` control connection. No other agent type has a memory port, do not wire memory to any of them.
+
+Framework-specific notes:
+
+- `agent_crewai_manager` takes an **optional `tool` port** (min 0) for cross-cutting tools the manager itself calls; task tools normally attach to its sub-agents instead. Each `agent_crewai_subagent` joins the crew by declaring `control: [{ "classType": "crewai", "from": "<manager_id>" }]`, and at least one sub-agent is required.
+- `agent_deepagent` can optionally delegate to `agent_deepagent_subagent` nodes, which declare `control: [{ "classType": "deepagent", "from": "<agent_id>" }]`.
+- The sub-agent nodes (`agent_crewai_subagent`, `agent_deepagent_subagent`) have no data lanes: they live entirely on the control plane, with their own required LLM and optional tools declaring `control` entries that point at the sub-agent.
 
 ### Multi-Agent Pipelines
 
@@ -438,7 +454,7 @@ Any string value in `config` can use `${ROCKETRIDE_<name>}` to inject values fro
    ROCKETRIDE_QDRANT_PORT=6333
    ```
 
-2. **Update `env.example`** with the same variable names but placeholder values. This file can be safely committed to the repo so other developers know what to configure:
+2. **Update `.env.example`** with the same variable names but placeholder values. Unlike `.env` — which holds the real key and must stay gitignored — this file is safe to commit so other developers know what to configure:
    ```env
    ROCKETRIDE_OPENAI_KEY=your-openai-api-key-here
    ROCKETRIDE_QDRANT_HOST=localhost
@@ -446,6 +462,12 @@ Any string value in `config` can use `${ROCKETRIDE_<name>}` to inject values fro
    ```
 
 Only variables prefixed with `ROCKETRIDE_` are substituted. Unknown variables are left unchanged.
+
+**For MCP callers**: the `list_integrations` tool reports per-integration
+credential readiness (`configured`/`unconfirmed`/`available`) plus which
+`ROCKETRIDE_*` variables a node still needs. `list_components`' `wiring`
+field gives the exact `${...}` placeholders to copy into `config` for
+components that are already configured.
 
 ---
 
@@ -524,11 +546,15 @@ Space each parallel agent 160px apart on the y-axis. The response node sits at t
 
 ### Choose a Source Component
 
-| Need             | Use       | Client Method                         |
-| ---------------- | --------- | ------------------------------------- |
-| Chat/Q&A system  | `chat`    | `client.chat()`                       |
-| Document uploads | `webhook` | `client.send()`, `client.sendFiles()` |
-| Drag & drop      | `dropper` | `client.sendFiles()`                  |
+| Need                                  | Use                | Client Method                                               |
+| ------------------------------------- | ------------------ | ----------------------------------------------------------- |
+| Chat/Q&A system                       | `chat`             | `client.chat()`                                             |
+| Document uploads                      | `webhook`          | `client.send()`, `client.sendFiles()`                       |
+| Drag & drop                           | `dropper`          | `client.sendFiles()`                                        |
+| Local file system ingestion           | `filesys`          | None: reads the server's file system when the pipeline runs |
+| Platform file-store ingestion         | `filestore_source` | None: reads the platform file store                         |
+| Telegram bot (text/image/audio/video) | `telegram`         | None: messages arrive via the Telegram Bot API              |
+| Host tools with no data flow          | `tools`            | None: transfers no data, exists only to host tool nodes     |
 
 ### Choose an LLM
 
