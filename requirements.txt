@@ -5,4 +5,4 @@ altair
 scikit-learn
 torch
 torch-geometric
-requests
+requestshttpx2
